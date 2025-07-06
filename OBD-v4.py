@@ -1,269 +1,325 @@
-"""
-=======================================================================
-    OBD-II Live Data Logger — Logs VEH_NO, VEH_TYPE, YR_MFR & Timestamp
-=======================================================================
-    File Name: OBD-v4.py
-
-📄 Description:
-    This Python script connects to a Bluetooth-based ELM327 OBD-II adapter,
-    collects real-time vehicle telemetry data, and logs it to a single CSV file
-    for all vehicles. The CSV log includes vehicle metadata such as vehicle
-    number, type, and year of manufacture along with a timezone-aware timestamp.
-
-🔧 Features:
-    - Automatically scans and connects to Bluetooth serial ports.
-    - Queries ECU for key engine and environmental parameters.
-    - Appends readings row-wise to a common CSV file in UTF-8 (Excel-safe).
-    - Prints live tabular data to terminal.
-    - Supports both metric and imperial units.
-
-📁 Output:
-    - A unified dataset: `obd_dataset.csv`
-    - UTF-8 with BOM encoding for Excel compatibility
-
-🛠 Dependencies:
-    - python-OBD
-    - pyserial
-    - pytz
-
-🧪 Logged OBD-II Parameters:
-    - Coolant Temperature
-    - Engine RPM
-    - Throttle Position
-    - Engine Load
-    - Vehicle Speed
-    - Fuel Level
-    - Intake Air Temperature
-    - Ambient Air Temperature
-
-📅 Author: Farooque Azam
-🗓️ Last Modified: 2025-07-06
-"""
-
+import tkinter as tk
+from tkinter import ttk
+import serial.tools.list_ports
+import threading
 import time
 from datetime import datetime
 import csv
-import re
 import os
-import serial
-import serial.tools.list_ports
 import pytz
+import re
+import json
 from obd import OBD, commands
 
-# ------------------------- Configuration -------------------------
+# -------------------- Config Storage --------------------
+CONFIG_FILE = "veh_config.json"
 
-PROTOCOL = "6"           # OBD-II protocol (ISO 15765-4 CAN)
-BAUDRATE = 38400         # Bluetooth ELM327 default baudrate
-REFRESH_RATE = 1.0       # Time (in seconds) between samples
-UNITS = "metric"         # "metric" for °C/km/h, "imperial" for °F/mph
+def load_config():
+    """Loads vehicle configuration from a JSON file."""
+    if os.path.isfile(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {"VEH_NO": "BBJ-91", "VEH_TYPE": "Chery Tiggo 8 Pro", "YR_MFR": "2023"}
 
-VEH_NO    = "BBJ-91"                 # Vehicle registration number
-VEH_TYPE  = "Chery Tiggo 8 Pro"      # Model/make
-YR_MFR    = "2023"                   # Year of manufacture
-TIMEZONE  = "Asia/Karachi"           # Local timezone for timestamp
+def save_config(config):
+    """Saves vehicle configuration to a JSON file."""
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f)
 
-CSV_FILENAME = "obd_dataset.csv"     # Common dataset file
+# -------------------- Global Settings --------------------
+config = load_config()
+TIMEZONE = "Asia/Karachi"
+CSV_FILENAME = "obd_dataset.csv"
+UNITS = "metric"
+REFRESH_RATE = 1.0
+BAUDRATE = 38400
 
-# ------------------------- Data Setup ----------------------------
-
+# -------------------- Headers --------------------
 headers = [
-    "Timestamp", "Vehicle No", "Vehicle Type", "Year",
-    "Coolant Temp", "Engine RPM", "Throttle Pos", "Engine Load",
+    "Timestamp", "Coolant Temp", "Engine RPM", "Throttle Pos", "Engine Load",
     "Speed", "Fuel Level", "Intake Temp", "Ambient Temp"
 ]
 
-# ------------------------- Utility Functions ---------------------
-
-def clear_console():
-    """Clears the terminal using ANSI escape sequences."""
-    print("\033[H\033[J", end="")
-
+# -------------------- Utility Functions --------------------
 def extract_mac_from_hwid(hwid: str) -> str:
     """
-    Extracts MAC address from a device HWID string.
-    Returns formatted MAC address or default if not found.
+    ADDED: Extracts MAC address from a device HWID string.
+    Returns formatted MAC address or a default zero-MAC if not found.
     """
     match = re.search(r'&([0-9A-F]{12})', hwid.upper())
     if match:
         mac_raw = match.group(1)
-        mac = ":".join(mac_raw[i:i+2] for i in range(0, 12, 2))
-        return mac
+        return ":".join(mac_raw[i:i+2] for i in range(0, 12, 2))
     return "00:00:00:00:00:00"
 
 def list_paired_bluetooth_ports():
     """
-    Lists COM ports with Bluetooth devices having valid MAC addresses.
-    Returns a list of tuples: (port, MAC)
+    MODIFIED: Filters for COM ports that have a valid (non-zero) 
+    MAC address in their hardware ID.
     """
-    ports = serial.tools.list_ports.comports()
-    filtered = []
-    for port in ports:
+    all_ports = serial.tools.list_ports.comports()
+    paired_ports = []
+    for port in all_ports:
+        # We only care about Bluetooth ports with a real MAC address
         if "Bluetooth" in port.description:
             mac = extract_mac_from_hwid(port.hwid)
             if mac != "00:00:00:00:00:00":
-                filtered.append((port.device, mac))
-    return filtered
+                paired_ports.append(port.device)
+    return paired_ports
 
-def get_formatted_value(response, unit):
-    """
-    Parses and formats the OBD-II response to include appropriate units.
-    Automatically converts to imperial if selected.
-    """
-    if response.is_null():
-        return None
+def get_formatted_value(response):
+    """Formats OBD response values, handling nulls and units."""
+    if response is None or response.is_null() or response.value is None:
+        return "N/A"
+    
     value = response.value.magnitude
-
-    if unit == "°C" and UNITS == "imperial":
-        value = value * 9/5 + 32
-        unit = "°F"
-    elif unit == "km/h" and UNITS == "imperial":
-        value = value * 0.621371
-        unit = "mph"
-
-    return f"{value:.1f} {unit}" if isinstance(value, float) else f"{value} {unit}"
-
-def display_table(data, port):
-    """
-    Displays a live table of sensor data in the terminal.
-    Shows current COM port and connection protocol.
-    """
-    clear_console()
-    print(f"=== OBD-II MONITOR [{UNITS.upper()}] ===")
-    print(f"Connected via {port} | Protocol: {connection.protocol_name()}")
-    print(f"Refresh Rate: {REFRESH_RATE}s | Press Ctrl+C to stop\n")
-    print("|".join(f"{h:^15}" for h in headers))
-    print("-" * (15 * len(headers) + len(headers) - 1))
-    for row in data:
-        print("|".join(f"{str(x):^15}" for x in row))
+    unit_label = response.unit
+    
+    if isinstance(value, float):
+        return f"{value:.1f} {unit_label}"
+    return f"{value} {unit_label}"
 
 def initialize_csv(file_path):
-    """
-    Initializes the CSV file if it doesn't exist.
-    Writes header row only once.
-    """
+    """Creates the CSV file with headers if it doesn't exist."""
     if not os.path.isfile(file_path):
-        with open(file_path, 'w', newline='', encoding='utf-8-sig') as file:
-            writer = csv.writer(file)
-            writer.writerow(headers)
+        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Vehicle No", "Vehicle Type", "Year"] + headers[1:])
 
 def append_row_to_csv(file_path, row):
-    """
-    Appends a single row of sensor data to the CSV file using UTF-8 BOM encoding.
-    """
-    with open(file_path, 'a', newline='', encoding='utf-8-sig') as file:
-        writer = csv.writer(file)
+    """Appends a single data row to the CSV file."""
+    with open(file_path, 'a', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
         writer.writerow(row)
 
-# ------------------------- Connection Logic ----------------------
+# -------------------- GUI Class --------------------
+class OBDLoggerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("OBD-II Logger GUI v5.0")
 
-def connect_with_retry(protocol, baudrate=38400, retries=5, delay=2, timeout=3):
-    """
-    Tries to connect to all paired Bluetooth COM ports.
-    Returns a working OBD connection and its port, or None.
-    """
-    print("🔄 Waiting before first attempt...")
-    time.sleep(5)
+        self.connection = None
+        self.running = False
 
-    print("🔍 Scanning for paired Bluetooth OBD-II devices...")
-    available_ports = list_paired_bluetooth_ports()
+        self.veh_no = tk.StringVar(value=config.get("VEH_NO"))
+        self.veh_type = tk.StringVar(value=config.get("VEH_TYPE"))
+        self.yr_mfr = tk.StringVar(value=config.get("YR_MFR"))
 
-    if not available_ports:
-        print("🚫 No paired Bluetooth OBD-II ports found.")
-        return None, None
+        self.create_widgets()
+        self.update_ports_list()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    print("🧭 Found paired ports:")
-    for port, mac in available_ports:
-        print(f"  - {port} (MAC: {mac})")
+    def create_widgets(self):
+        """Creates and places all the widgets in the application window."""
+        # --- Vehicle Info Frame ---
+        frm_info = ttk.Frame(self.root)
+        frm_info.pack(padx=10, pady=(10,5), fill='x')
 
-    for port, mac in available_ports:
-        print(f"\n🔍 Pre-checking {port} ({mac})...")
-        try:
-            time.sleep(2)
-            s = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
-            time.sleep(2)
-            s.close()
-            time.sleep(10)
-        except Exception as e:
-            print(f"⚠️ Skipping {port}: {e}")
-            continue
+        ttk.Label(frm_info, text="Vehicle No:").grid(row=0, column=0, padx=2, pady=2, sticky='w')
+        ttk.Entry(frm_info, textvariable=self.veh_no, width=15).grid(row=0, column=1)
 
-        for attempt in range(1, retries + 1):
-            print(f"🧪 Trying OBD connection on {port} (Attempt {attempt}/{retries})...")
+        ttk.Label(frm_info, text="Vehicle Type:").grid(row=0, column=2, padx=(10, 2), pady=2, sticky='w')
+        ttk.Entry(frm_info, textvariable=self.veh_type, width=25).grid(row=0, column=3)
+
+        ttk.Label(frm_info, text="Year:").grid(row=0, column=4, padx=(10, 2), pady=2, sticky='w')
+        ttk.Entry(frm_info, textvariable=self.yr_mfr, width=8).grid(row=0, column=5)
+
+        # --- Controls Frame ---
+        frm_controls = ttk.Frame(self.root)
+        frm_controls.pack(padx=10, pady=5, fill='x')
+        
+        ttk.Label(frm_controls, text="Paired Port:").pack(side='left', padx=(0,5))
+        self.port_combo = ttk.Combobox(frm_controls, state="readonly", width=10)
+        self.port_combo.pack(side='left', padx=(0,5))
+        
+        self.refresh_btn = ttk.Button(frm_controls, text="Refresh", command=self.update_ports_list, width=8)
+        self.refresh_btn.pack(side='left', padx=(0, 10))
+        
+        self.connect_btn = ttk.Button(frm_controls, text="Connect", command=self.toggle_connection, width=12)
+        self.connect_btn.pack(side='left', padx=(0, 5))
+
+        self.monitor_btn = ttk.Button(frm_controls, text="Start Monitoring", command=self.toggle_monitoring, state='disabled', width=18)
+        self.monitor_btn.pack(side='left')
+
+        self.status_label = ttk.Label(frm_controls, text="Status: Disconnected", foreground="red", font=('Helvetica', 10, 'bold'))
+        self.status_label.pack(side='left', padx=(10, 0))
+        
+        self.tree = ttk.Treeview(self.root, columns=headers, show='headings', height=12)
+        for h in headers:
+            self.tree.heading(h, text=h)
+            self.tree.column(h, width=110, anchor='center')
+        self.tree.pack(fill='both', expand=True, padx=10, pady=5)
+
+        self.log_output = tk.Text(self.root, height=8, bg="black", fg="lime green", wrap='word', font=("Courier New", 9))
+        self.log_output.pack(fill='both', expand=True, padx=10, pady=5)
+
+    def update_ports_list(self):
+        """Scans for paired Bluetooth COM ports and updates the combobox."""
+        self.log("Scanning for paired Bluetooth devices by MAC address...")
+        ports = list_paired_bluetooth_ports()
+        self.port_combo['values'] = ports
+        if ports:
+            self.port_combo.current(0)
+            self.log(f"Found paired ports: {', '.join(ports)}")
+        else:
+            self.log("No paired Bluetooth devices with valid MAC addresses found.")
+            self.port_combo.set('')
+
+    def log(self, msg):
+        """Thread-safe method to log messages to the GUI's text widget."""
+        self.root.after(0, self._log_message, msg)
+
+    def _log_message(self, msg):
+        self.log_output.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')}: {msg}\n")
+        self.log_output.see(tk.END)
+
+    def toggle_connection(self):
+        """Toggles the connection state."""
+        if self.connection and self.connection.is_connected():
+            self.disconnect()
+        else:
+            self.connect()
+    
+    def connect(self):
+        """Starts the connection process using the selected COM port."""
+        port = self.port_combo.get()
+        if not port:
+            self.log("⚠️ Please select a paired port first.")
+            return
+
+        self.log(f"🚀 Starting connection process for {port}...")
+        self.connect_btn.config(state='disabled')
+        self.monitor_btn.config(state='disabled')
+        self.port_combo.config(state='disabled')
+        self.refresh_btn.config(state='disabled')
+        self.status_label.config(text=f"Status: Connecting to {port}...", foreground="orange")
+        
+        threading.Thread(target=self.attempt_connection_on_port, args=(port,), daemon=True).start()
+
+    def attempt_connection_on_port(self, port):
+        """Attempts to connect to a specific port, with retries. This runs in a thread."""
+        for attempt in range(1, 4):
+            self.log(f"🧪 Trying connection on {port} (Attempt {attempt}/3)...")
             try:
-                connection = OBD(
-                    portstr=port,
-                    baudrate=baudrate,
-                    protocol=protocol,
-                    fast=False,
-                    timeout=timeout
-                )
-                if connection.is_connected():
-                    print(f"✅ Connected successfully on {port}")
-                    return connection, port
+                conn = OBD(portstr=port, baudrate=BAUDRATE, fast=False, timeout=5)
+                
+                if conn.is_connected():
+                    self.log(f"✅ Connection successful on {port}!")
+                    self.connection = conn
+                    self.root.after(0, self.update_ui_on_connect, port)
+                    return
                 else:
-                    print(f"❌ {port} did not respond as OBD.")
-                    connection.close()
+                    self.log(f"❌ {port} did not respond as an OBD device.")
+                    conn.close()
             except Exception as e:
-                print(f"⛔ Error on {port}: {e}")
-            time.sleep(delay)
+                self.log(f"⛔ Error on {port}: {str(e).strip()}")
+            
+            time.sleep(2)
 
-    print("🚫 No responsive OBD-II adapter found.")
-    return None, None
+        self.log(f"🚫 All connection attempts failed for {port}.")
+        self.root.after(0, self.update_ui_on_fail, "Connection Failed")
 
-# ------------------------- Main Monitoring -----------------------
+    def update_ui_on_connect(self, port):
+        """Updates the GUI to reflect a successful connection."""
+        self.status_label.config(text=f"Status: Connected on {port}", foreground="green")
+        self.connect_btn.config(text="Disconnect", state='normal')
+        self.monitor_btn.config(state='normal')
 
-def main():
-    """
-    Entry point for live data monitoring and CSV logging.
-    """
-    global connection
-    connection, detected_port = connect_with_retry(PROTOCOL, BAUDRATE)
+    def update_ui_on_fail(self, reason):
+        """Updates the GUI to reflect a failed connection attempt."""
+        self.status_label.config(text=f"Status: {reason}", foreground="red")
+        self.connect_btn.config(text="Connect", state='normal')
+        self.port_combo.config(state='readonly')
+        self.refresh_btn.config(state='normal')
+        self.connection = None
 
-    if not connection or not connection.is_connected():
-        print("❌ Could not establish a stable connection to the vehicle.")
-        return
+    def disconnect(self):
+        """Disconnects from the OBD adapter and resets the UI."""
+        self.log("🔌 Disconnecting...")
+        if self.running:
+            self.toggle_monitoring()
+        
+        if self.connection:
+            self.connection.close()
+        self.connection = None
 
-    print("✅ OBD-II adapter connected.")
-    print("⏳ Waiting 2 seconds to stabilize...")
-    time.sleep(2)
+        self.status_label.config(text="Status: Disconnected", foreground="red")
+        self.connect_btn.config(text="Connect", state='normal')
+        self.monitor_btn.config(state='disabled')
+        self.port_combo.config(state='readonly')
+        self.refresh_btn.config(state='normal')
+        self.log("Disconnected successfully.")
 
-    initialize_csv(CSV_FILENAME)
+    def toggle_monitoring(self):
+        """Starts or stops the data monitoring loop."""
+        if self.running:
+            self.running = False
+            self.monitor_btn.config(text="Start Monitoring")
+            self.log("⏹️ Monitoring stopped.")
+        else:
+            self.running = True
+            self.monitor_btn.config(text="Stop Monitoring")
+            self.log("▶️ Monitoring started...")
+            initialize_csv(CSV_FILENAME)
+            threading.Thread(target=self.monitor_data, daemon=True).start()
 
-    try:
-        while True:
+    def monitor_data(self):
+        """The main data-gathering loop. Runs in a thread."""
+        while self.running:
+            if not self.connection or not self.connection.is_connected():
+                self.log("⚠️ Connection lost! Stopping monitoring.")
+                self.root.after(0, self.disconnect)
+                break
+
             now = datetime.now(pytz.timezone(TIMEZONE))
             timestamp = now.isoformat()
-
-            row = [
-                timestamp,
-                VEH_NO,
-                VEH_TYPE,
-                YR_MFR,
-                get_formatted_value(connection.query(commands.COOLANT_TEMP), '°C'),
-                get_formatted_value(connection.query(commands.RPM), ''),
-                get_formatted_value(connection.query(commands.THROTTLE_POS), '%'),
-                get_formatted_value(connection.query(commands.ENGINE_LOAD), '%'),
-                get_formatted_value(connection.query(commands.SPEED), 'km/h'),
-                get_formatted_value(connection.query(commands.FUEL_LEVEL), '%'),
-                get_formatted_value(connection.query(commands.INTAKE_TEMP), '°C'),
-                get_formatted_value(connection.query(commands.AMBIANT_AIR_TEMP), '°C')
-            ]
-
-            append_row_to_csv(CSV_FILENAME, row)
-            display_table([row], detected_port)
+            
+            data_points = {
+                "Coolant Temp": get_formatted_value(self.connection.query(commands.COOLANT_TEMP)),
+                "Engine RPM": get_formatted_value(self.connection.query(commands.RPM)),
+                "Throttle Pos": get_formatted_value(self.connection.query(commands.THROTTLE_POS)),
+                "Engine Load": get_formatted_value(self.connection.query(commands.ENGINE_LOAD)),
+                "Speed": get_formatted_value(self.connection.query(commands.SPEED)),
+                "Fuel Level": get_formatted_value(self.connection.query(commands.FUEL_LEVEL)),
+                "Intake Temp": get_formatted_value(self.connection.query(commands.INTAKE_TEMP)),
+                "Ambient Temp": get_formatted_value(self.connection.query(commands.AMBIANT_AIR_TEMP)),
+            }
+            
+            row_data = [data_points.get(h, "N/A") for h in headers[1:]]
+            
+            self.root.after(0, self.update_gui_and_csv, timestamp, row_data)
+            
             time.sleep(REFRESH_RATE)
+        
+        self.root.after(0, lambda: self.monitor_btn.config(text="Start Monitoring"))
+        self.running = False
+        
+    def update_gui_and_csv(self, timestamp, row_data):
+        """Safely updates the GUI table and writes to the CSV from the main thread."""
+        display_ts = timestamp.split('T')[1].split('+')[0].split('.')[0]
+        self.tree.insert('', 'end', values=[display_ts] + row_data)
+        self.tree.yview_moveto(1)
 
-    except KeyboardInterrupt:
-        print("\n⏹️ Monitoring stopped by user.")
+        full_row = [timestamp, self.veh_no.get(), self.veh_type.get(), self.yr_mfr.get()] + row_data
+        append_row_to_csv(CSV_FILENAME, full_row)
 
-    finally:
-        connection.close()
-        print("🔌 OBD connection closed.")
+    def on_closing(self):
+        """Handles window close event, saving config and disconnecting."""
+        self.log("Exiting application...")
+        current_config = {
+            "VEH_NO": self.veh_no.get(),
+            "VEH_TYPE": self.veh_type.get(),
+            "YR_MFR": self.yr_mfr.get()
+        }
+        save_config(current_config)
+        
+        if self.connection and self.connection.is_connected():
+            threading.Thread(target=self.connection.close, daemon=True).start()
+        
+        self.root.destroy()
 
-# ------------------------- Entry Point ---------------------------
-
+# -------------------- Main Entry Point --------------------
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n🛑 Program interrupted by user. Exiting gracefully...")
+    root = tk.Tk()
+    app = OBDLoggerApp(root)
+    root.mainloop()
