@@ -1,94 +1,87 @@
 """
 =======================================================================
-    OBD-II Live Data Logger for Paired Bluetooth ELM327 Adapters
+    OBD-II Live Data Logger — Logs VEH_NO, VEH_TYPE, YR_MFR & Timestamp
 =======================================================================
+    File Name: OBD-v3.py
 
 📄 Description:
-    This script automatically detects and connects to a **paired Bluetooth OBD-II adapter** 
-    (like ELM327) via a serial COM port, retrieves real-time vehicle diagnostics data from 
-    the ECU, and displays it in a live terminal table. The data is also optionally saved to 
-    a CSV file upon exit.
+    This Python script connects to a Bluetooth-based ELM327 OBD-II adapter,
+    collects real-time vehicle telemetry data, and logs it to a single CSV file
+    for all vehicles. The CSV log includes vehicle metadata such as vehicle
+    number, type, and year of manufacture along with a timezone-aware timestamp.
 
-🔧 Key Features:
-    - Scans only **Bluetooth COM ports** with valid MAC addresses.
-    - Detects and connects to the first **responsive OBD-II adapter**.
-    - Displays live data (Coolant Temp, RPM, Speed, Throttle, etc.) in tabular format.
-    - Optionally saves log to CSV upon termination.
-    - Supports metric and imperial unit systems.
+🔧 Features:
+    - Automatically scans and connects to Bluetooth serial ports.
+    - Queries ECU for key engine and environmental parameters.
+    - Appends readings row-wise to a common CSV file in UTF-8 (Excel-safe).
+    - Prints live tabular data to terminal.
+    - Supports both metric and imperial units.
 
-🛠️ Requirements:
-    - Python 3.7+
-    - `python-OBD` (for OBD communication)
-    - `pyserial` (for COM port detection and access)
+📁 Output:
+    - A unified dataset: `obd_dataset.csv`
+    - UTF-8 with BOM encoding for Excel compatibility
 
-📦 Install dependencies:
-    pip install obd pyserial
+🛠 Dependencies:
+    - python-OBD
+    - pyserial
+    - pytz
 
-🚗 Compatible with:
-    - ELM327 Bluetooth adapters (Standard OBD-II Protocols)
-    - Tested on Windows (adjustable for Linux/macOS if needed)
-
-🧪 Sample OBD-II Parameters Queried:
+🧪 Logged OBD-II Parameters:
     - Coolant Temperature
     - Engine RPM
     - Throttle Position
     - Engine Load
     - Vehicle Speed
     - Fuel Level
-    - Intake Air Temp
-    - Ambient Air Temp
-
-📁 Output:
-    - Real-time terminal table
-    - CSV file with timestamped readings (optional on exit)
+    - Intake Air Temperature
+    - Ambient Air Temperature
 
 📅 Author: Farooque Azam
-🗓️ Last Modified: 2025-07-05
-
-=======================================================================
+🗓️ Last Modified: 2025-07-06
 """
 
 import time
 from datetime import datetime
 import csv
 import re
+import os
 import serial
 import serial.tools.list_ports
+import pytz
 from obd import OBD, commands
 
 # ------------------------- Configuration -------------------------
 
-PROTOCOL = "6"           # OBD-II protocol (e.g., "6" = ISO 15765-4 CAN)
-BAUDRATE = 38400         # Common for Bluetooth ELM327
-REFRESH_RATE = 1.0       # Time between readings (in seconds)
-UNITS = "metric"         # Use "imperial" for °F and mph
+PROTOCOL = "6"           # OBD-II protocol (ISO 15765-4 CAN)
+BAUDRATE = 38400         # Bluetooth ELM327 default baudrate
+REFRESH_RATE = 1.0       # Time (in seconds) between samples
+UNITS = "metric"         # "metric" for °C/km/h, "imperial" for °F/mph
+
+VEH_NO    = "BBJ-91"                 # Vehicle registration number
+VEH_TYPE  = "Chery Tiggo 8 Pro"      # Model/make
+YR_MFR    = "2023"                   # Year of manufacture
+TIMEZONE  = "Asia/Karachi"           # Local timezone for timestamp
+
+CSV_FILENAME = "obd_dataset.csv"     # Common dataset file
 
 # ------------------------- Data Setup ----------------------------
 
-data_log = []  # Collected sensor readings
-
-# Headers for CSV and display
 headers = [
-    "Timestamp", "Coolant Temp", "Engine RPM",
-    "Throttle Pos", "Engine Load", "Speed",
-    "Fuel Level", "Intake Temp", "Ambient Temp"
+    "Timestamp", "Vehicle No", "Vehicle Type", "Year",
+    "Coolant Temp", "Engine RPM", "Throttle Pos", "Engine Load",
+    "Speed", "Fuel Level", "Intake Temp", "Ambient Temp"
 ]
 
 # ------------------------- Utility Functions ---------------------
 
 def clear_console():
-    """Clears the terminal output using ANSI escape codes."""
+    """Clears the terminal using ANSI escape sequences."""
     print("\033[H\033[J", end="")
 
 def extract_mac_from_hwid(hwid: str) -> str:
     """
-    Extracts MAC address from HWID string.
-
-    Parameters:
-        hwid (str): Hardware ID string from serial.tools.list_ports
-
-    Returns:
-        str: MAC address formatted as XX:XX:XX:XX:XX:XX or default 00:... if not found
+    Extracts MAC address from a device HWID string.
+    Returns formatted MAC address or default if not found.
     """
     match = re.search(r'&([0-9A-F]{12})', hwid.upper())
     if match:
@@ -99,10 +92,8 @@ def extract_mac_from_hwid(hwid: str) -> str:
 
 def list_paired_bluetooth_ports():
     """
-    Lists only paired Bluetooth serial ports with valid MACs.
-
-    Returns:
-        list of tuples: [(COMx, MAC), ...]
+    Lists COM ports with Bluetooth devices having valid MAC addresses.
+    Returns a list of tuples: (port, MAC)
     """
     ports = serial.tools.list_ports.comports()
     filtered = []
@@ -115,20 +106,13 @@ def list_paired_bluetooth_ports():
 
 def get_formatted_value(response, unit):
     """
-    Parses and formats sensor values from OBD response.
-
-    Parameters:
-        response (obd.OBDResponse): OBD sensor response
-        unit (str): Expected unit (e.g., °C, %, km/h)
-
-    Returns:
-        str or None: Formatted value with unit
+    Parses and formats the OBD-II response to include appropriate units.
+    Automatically converts to imperial if selected.
     """
     if response.is_null():
         return None
     value = response.value.magnitude
 
-    # Unit conversion if needed
     if unit == "°C" and UNITS == "imperial":
         value = value * 9/5 + 32
         unit = "°F"
@@ -140,11 +124,8 @@ def get_formatted_value(response, unit):
 
 def display_table(data, port):
     """
-    Clears and displays live OBD data in tabular format.
-
-    Parameters:
-        data (list): List of data rows
-        port (str): Connected COM port for display
+    Displays a live table of sensor data in the terminal.
+    Shows current COM port and connection protocol.
     """
     clear_console()
     print(f"=== OBD-II MONITOR [{UNITS.upper()}] ===")
@@ -155,31 +136,30 @@ def display_table(data, port):
     for row in data:
         print("|".join(f"{str(x):^15}" for x in row))
 
-def save_to_csv(data):
+def initialize_csv(file_path):
     """
-    Saves the data log to a timestamped CSV file.
-
-    Parameters:
-        data (list): Collected OBD data rows
+    Initializes the CSV file if it doesn't exist.
+    Writes header row only once.
     """
-    filename = f"obd_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    try:
-        with open(filename, 'w', newline='') as file:
+    if not os.path.isfile(file_path):
+        with open(file_path, 'w', newline='', encoding='utf-8-sig') as file:
             writer = csv.writer(file)
             writer.writerow(headers)
-            writer.writerows(data)
-        print(f"\n✅ Data saved to {filename}")
-    except Exception as e:
-        print(f"\n❌ Error saving CSV: {e}")
+
+def append_row_to_csv(file_path, row):
+    """
+    Appends a single row of sensor data to the CSV file using UTF-8 BOM encoding.
+    """
+    with open(file_path, 'a', newline='', encoding='utf-8-sig') as file:
+        writer = csv.writer(file)
+        writer.writerow(row)
 
 # ------------------------- Connection Logic ----------------------
 
 def connect_with_retry(protocol, baudrate=38400, retries=5, delay=2, timeout=3):
     """
-    Scans paired Bluetooth COM ports and attempts to connect to OBD-II.
-
-    Returns:
-        tuple: (OBD connection object, port name) if successful, else (None, None)
+    Tries to connect to all paired Bluetooth COM ports.
+    Returns a working OBD connection and its port, or None.
     """
     print("🔄 Waiting before first attempt...")
     time.sleep(5)
@@ -202,7 +182,7 @@ def connect_with_retry(protocol, baudrate=38400, retries=5, delay=2, timeout=3):
             s = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
             time.sleep(2)
             s.close()
-            time.sleep(10)  # Allow the device to settle
+            time.sleep(10)
         except Exception as e:
             print(f"⚠️ Skipping {port}: {e}")
             continue
@@ -233,6 +213,9 @@ def connect_with_retry(protocol, baudrate=38400, retries=5, delay=2, timeout=3):
 # ------------------------- Main Monitoring -----------------------
 
 def main():
+    """
+    Entry point for live data monitoring and CSV logging.
+    """
     global connection
     connection, detected_port = connect_with_retry(PROTOCOL, BAUDRATE)
 
@@ -244,11 +227,18 @@ def main():
     print("⏳ Waiting 2 seconds to stabilize...")
     time.sleep(2)
 
+    initialize_csv(CSV_FILENAME)
+
     try:
         while True:
-            timestamp = datetime.now().strftime('%H:%M:%S')
+            now = datetime.now(pytz.timezone(TIMEZONE))
+            timestamp = now.isoformat()
+
             row = [
                 timestamp,
+                VEH_NO,
+                VEH_TYPE,
+                YR_MFR,
                 get_formatted_value(connection.query(commands.COOLANT_TEMP), '°C'),
                 get_formatted_value(connection.query(commands.RPM), ''),
                 get_formatted_value(connection.query(commands.THROTTLE_POS), '%'),
@@ -258,16 +248,13 @@ def main():
                 get_formatted_value(connection.query(commands.INTAKE_TEMP), '°C'),
                 get_formatted_value(connection.query(commands.AMBIANT_AIR_TEMP), '°C')
             ]
-            data_log.append(row)
-            display_table(data_log, detected_port)
+
+            append_row_to_csv(CSV_FILENAME, row)
+            display_table([row], detected_port)
             time.sleep(REFRESH_RATE)
 
     except KeyboardInterrupt:
         print("\n⏹️ Monitoring stopped by user.")
-        if data_log:
-            save = input("💾 Save data to CSV? (y/n): ").strip().lower()
-            if save == 'y':
-                save_to_csv(data_log)
 
     finally:
         connection.close()

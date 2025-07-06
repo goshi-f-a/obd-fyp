@@ -2,7 +2,8 @@
 =======================================================================
     OBD-II Live Data Logger for Paired Bluetooth ELM327 Adapters
 =======================================================================
-
+    File Name: OBD-v2.py
+    
 📄 Description:
     This script automatically detects and connects to a **paired Bluetooth OBD-II adapter** 
     (like ELM327) via a serial COM port, retrieves real-time vehicle diagnostics data from 
