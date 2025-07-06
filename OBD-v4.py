@@ -42,10 +42,7 @@ headers = [
 
 # -------------------- Utility Functions --------------------
 def extract_mac_from_hwid(hwid: str) -> str:
-    """
-    ADDED: Extracts MAC address from a device HWID string.
-    Returns formatted MAC address or a default zero-MAC if not found.
-    """
+    """Extracts MAC address from a device HWID string."""
     match = re.search(r'&([0-9A-F]{12})', hwid.upper())
     if match:
         mac_raw = match.group(1)
@@ -53,14 +50,10 @@ def extract_mac_from_hwid(hwid: str) -> str:
     return "00:00:00:00:00:00"
 
 def list_paired_bluetooth_ports():
-    """
-    MODIFIED: Filters for COM ports that have a valid (non-zero) 
-    MAC address in their hardware ID.
-    """
+    """Filters for COM ports that have a valid (non-zero) MAC address."""
     all_ports = serial.tools.list_ports.comports()
     paired_ports = []
     for port in all_ports:
-        # We only care about Bluetooth ports with a real MAC address
         if "Bluetooth" in port.description:
             mac = extract_mac_from_hwid(port.hwid)
             if mac != "00:00:00:00:00:00":
@@ -96,14 +89,24 @@ def append_row_to_csv(file_path, row):
 class OBDLoggerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("OBD-II Logger GUI v5.0")
+        self.root.title("OBD-II Logger GUI v7.0")
 
         self.connection = None
         self.running = False
 
+        # StringVars for entry boxes
         self.veh_no = tk.StringVar(value=config.get("VEH_NO"))
         self.veh_type = tk.StringVar(value=config.get("VEH_TYPE"))
         self.yr_mfr = tk.StringVar(value=config.get("YR_MFR"))
+
+        # --- ADDED: Vars for column visibility and sorting ---
+        self.column_vars = {h: tk.BooleanVar(value=True) for h in headers}
+        self.last_sort = {'col': None, 'rev': False}
+
+        # StringVars for the display labels
+        self.display_veh_no = tk.StringVar(value="Vehicle No: --")
+        self.display_veh_type = tk.StringVar(value="Vehicle Type: --")
+        self.display_yr_mfr = tk.StringVar(value="Year: --")
 
         self.create_widgets()
         self.update_ports_list()
@@ -111,18 +114,25 @@ class OBDLoggerApp:
 
     def create_widgets(self):
         """Creates and places all the widgets in the application window."""
-        # --- Vehicle Info Frame ---
+        # --- Vehicle Info Frame (Entry boxes) ---
         frm_info = ttk.Frame(self.root)
         frm_info.pack(padx=10, pady=(10,5), fill='x')
 
         ttk.Label(frm_info, text="Vehicle No:").grid(row=0, column=0, padx=2, pady=2, sticky='w')
         ttk.Entry(frm_info, textvariable=self.veh_no, width=15).grid(row=0, column=1)
-
         ttk.Label(frm_info, text="Vehicle Type:").grid(row=0, column=2, padx=(10, 2), pady=2, sticky='w')
         ttk.Entry(frm_info, textvariable=self.veh_type, width=25).grid(row=0, column=3)
-
         ttk.Label(frm_info, text="Year:").grid(row=0, column=4, padx=(10, 2), pady=2, sticky='w')
         ttk.Entry(frm_info, textvariable=self.yr_mfr, width=8).grid(row=0, column=5)
+        
+        # --- ADDED: Frame for column visibility checkboxes ---
+        frm_cols = ttk.LabelFrame(self.root, text="Show/Hide Columns")
+        frm_cols.pack(padx=10, pady=5, fill='x')
+        # Place checkboxes in a grid within the frame
+        for i, col in enumerate(headers):
+            cb = ttk.Checkbutton(frm_cols, text=col, variable=self.column_vars[col], command=self.update_visible_columns)
+            cb.grid(row=0, column=i, padx=5, sticky='w')
+
 
         # --- Controls Frame ---
         frm_controls = ttk.Frame(self.root)
@@ -131,27 +141,68 @@ class OBDLoggerApp:
         ttk.Label(frm_controls, text="Paired Port:").pack(side='left', padx=(0,5))
         self.port_combo = ttk.Combobox(frm_controls, state="readonly", width=10)
         self.port_combo.pack(side='left', padx=(0,5))
-        
         self.refresh_btn = ttk.Button(frm_controls, text="Refresh", command=self.update_ports_list, width=8)
         self.refresh_btn.pack(side='left', padx=(0, 10))
-        
         self.connect_btn = ttk.Button(frm_controls, text="Connect", command=self.toggle_connection, width=12)
         self.connect_btn.pack(side='left', padx=(0, 5))
-
         self.monitor_btn = ttk.Button(frm_controls, text="Start Monitoring", command=self.toggle_monitoring, state='disabled', width=18)
         self.monitor_btn.pack(side='left')
-
         self.status_label = ttk.Label(frm_controls, text="Status: Disconnected", foreground="red", font=('Helvetica', 10, 'bold'))
         self.status_label.pack(side='left', padx=(10, 0))
+
+        # --- Frame for displaying vehicle info labels ---
+        frm_display_info = ttk.Frame(self.root)
+        frm_display_info.pack(padx=10, pady=(5, 2), fill='x')
+        style = ttk.Style()
+        style.configure("Display.TLabel", font=('Helvetica', 9, 'bold'))
+        ttk.Label(frm_display_info, textvariable=self.display_veh_no, style="Display.TLabel").pack(side='left')
+        ttk.Label(frm_display_info, textvariable=self.display_veh_type, style="Display.TLabel").pack(side='left', padx=30)
+        ttk.Label(frm_display_info, textvariable=self.display_yr_mfr, style="Display.TLabel").pack(side='left')
         
+        # --- Treeview (Data Table) ---
         self.tree = ttk.Treeview(self.root, columns=headers, show='headings', height=12)
         for h in headers:
-            self.tree.heading(h, text=h)
+            # ADDED: Command for sorting on each header
+            self.tree.heading(h, text=h, command=lambda _h=h: self.sort_column(_h, False))
             self.tree.column(h, width=110, anchor='center')
-        self.tree.pack(fill='both', expand=True, padx=10, pady=5)
+        self.tree.pack(fill='both', expand=True, padx=10, pady=(0,5))
+        self.update_visible_columns() # Set initial visible columns
 
+        # --- Log Output ---
         self.log_output = tk.Text(self.root, height=8, bg="black", fg="lime green", wrap='word', font=("Courier New", 9))
         self.log_output.pack(fill='both', expand=True, padx=10, pady=5)
+
+    # --- ADDED: Method to update visible columns ---
+    def update_visible_columns(self):
+        """Updates the treeview to show only the columns selected via checkbox."""
+        visible_cols = [h for h, var in self.column_vars.items() if var.get()]
+        self.tree["displaycolumns"] = visible_cols
+
+    # --- ADDED: Method for sorting columns ---
+    def sort_column(self, col, reverse):
+        """Sorts a treeview column when its header is clicked."""
+        try:
+            # Extract numerical part for sorting, fall back to string if not possible
+            def get_sort_key(value_str):
+                if isinstance(value_str, str):
+                    match = re.match(r"(-?\d+\.?\d*)", value_str)
+                    if match:
+                        return float(match.group(1))
+                return value_str # Fallback for non-numeric strings
+
+            data = [(get_sort_key(self.tree.set(k, col)), k) for k in self.tree.get_children('')]
+        except tk.TclError:
+            self.log(f"Cannot sort by '{col}' as it is currently hidden.")
+            return # Cannot sort a hidden column
+
+        data.sort(reverse=reverse)
+
+        for index, (val, k) in enumerate(data):
+            self.tree.move(k, '', index)
+
+        # Toggle sort direction for the next click
+        self.tree.heading(col, command=lambda: self.sort_column(col, not reverse))
+
 
     def update_ports_list(self):
         """Scans for paired Bluetooth COM ports and updates the combobox."""
@@ -187,6 +238,11 @@ class OBDLoggerApp:
             self.log("⚠️ Please select a paired port first.")
             return
 
+        # Update the display labels with info from entry boxes
+        self.display_veh_no.set(f"Vehicle No: {self.veh_no.get()}")
+        self.display_veh_type.set(f"Vehicle Type: {self.veh_type.get()}")
+        self.display_yr_mfr.set(f"Year: {self.yr_mfr.get()}")
+        
         self.log(f"🚀 Starting connection process for {port}...")
         self.connect_btn.config(state='disabled')
         self.monitor_btn.config(state='disabled')
@@ -242,6 +298,11 @@ class OBDLoggerApp:
         if self.connection:
             self.connection.close()
         self.connection = None
+
+        # Reset display labels to their default state
+        self.display_veh_no.set("Vehicle No: --")
+        self.display_veh_type.set("Vehicle Type: --")
+        self.display_yr_mfr.set("Year: --")
 
         self.status_label.config(text="Status: Disconnected", foreground="red")
         self.connect_btn.config(text="Connect", state='normal')
