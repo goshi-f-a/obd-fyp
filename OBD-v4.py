@@ -31,7 +31,8 @@ config = load_config()
 TIMEZONE = "Asia/Karachi"
 CSV_FILENAME = "obd_dataset.csv"
 UNITS = "metric"
-REFRESH_RATE = 1.0
+# MODIFIED: Changed refresh rate to 2 seconds
+REFRESH_RATE = 2.0
 BAUDRATE = 38400
 
 # -------------------- Headers --------------------
@@ -50,14 +51,17 @@ def extract_mac_from_hwid(hwid: str) -> str:
     return "00:00:00:00:00:00"
 
 def list_paired_bluetooth_ports():
-    """Filters for COM ports that have a valid (non-zero) MAC address."""
+    """
+    Filters for COM ports with a valid MAC address
+    and returns a list of tuples (port_name, mac_address).
+    """
     all_ports = serial.tools.list_ports.comports()
     paired_ports = []
     for port in all_ports:
         if "Bluetooth" in port.description:
             mac = extract_mac_from_hwid(port.hwid)
             if mac != "00:00:00:00:00:00":
-                paired_ports.append(port.device)
+                paired_ports.append((port.device, mac))
     return paired_ports
 
 def get_formatted_value(response):
@@ -89,21 +93,21 @@ def append_row_to_csv(file_path, row):
 class OBDLoggerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("OBD-II Logger GUI v7.0")
+        self.root.title("OBD-II Logger GUI v11.0")
 
         self.connection = None
         self.running = False
+        
+        self.port_map = {}
 
         # StringVars for entry boxes
         self.veh_no = tk.StringVar(value=config.get("VEH_NO"))
         self.veh_type = tk.StringVar(value=config.get("VEH_TYPE"))
         self.yr_mfr = tk.StringVar(value=config.get("YR_MFR"))
 
-        # --- ADDED: Vars for column visibility and sorting ---
         self.column_vars = {h: tk.BooleanVar(value=True) for h in headers}
         self.last_sort = {'col': None, 'rev': False}
 
-        # StringVars for the display labels
         self.display_veh_no = tk.StringVar(value="Vehicle No: --")
         self.display_veh_type = tk.StringVar(value="Vehicle Type: --")
         self.display_yr_mfr = tk.StringVar(value="Year: --")
@@ -125,21 +129,18 @@ class OBDLoggerApp:
         ttk.Label(frm_info, text="Year:").grid(row=0, column=4, padx=(10, 2), pady=2, sticky='w')
         ttk.Entry(frm_info, textvariable=self.yr_mfr, width=8).grid(row=0, column=5)
         
-        # --- ADDED: Frame for column visibility checkboxes ---
         frm_cols = ttk.LabelFrame(self.root, text="Show/Hide Columns")
         frm_cols.pack(padx=10, pady=5, fill='x')
-        # Place checkboxes in a grid within the frame
         for i, col in enumerate(headers):
             cb = ttk.Checkbutton(frm_cols, text=col, variable=self.column_vars[col], command=self.update_visible_columns)
             cb.grid(row=0, column=i, padx=5, sticky='w')
-
 
         # --- Controls Frame ---
         frm_controls = ttk.Frame(self.root)
         frm_controls.pack(padx=10, pady=5, fill='x')
         
         ttk.Label(frm_controls, text="Paired Port:").pack(side='left', padx=(0,5))
-        self.port_combo = ttk.Combobox(frm_controls, state="readonly", width=10)
+        self.port_combo = ttk.Combobox(frm_controls, state="readonly", width=25)
         self.port_combo.pack(side='left', padx=(0,5))
         self.refresh_btn = ttk.Button(frm_controls, text="Refresh", command=self.update_ports_list, width=8)
         self.refresh_btn.pack(side='left', padx=(0, 10))
@@ -162,56 +163,55 @@ class OBDLoggerApp:
         # --- Treeview (Data Table) ---
         self.tree = ttk.Treeview(self.root, columns=headers, show='headings', height=12)
         for h in headers:
-            # ADDED: Command for sorting on each header
             self.tree.heading(h, text=h, command=lambda _h=h: self.sort_column(_h, False))
             self.tree.column(h, width=110, anchor='center')
         self.tree.pack(fill='both', expand=True, padx=10, pady=(0,5))
-        self.update_visible_columns() # Set initial visible columns
+        self.update_visible_columns()
 
-        # --- Log Output ---
-        self.log_output = tk.Text(self.root, height=8, bg="black", fg="lime green", wrap='word', font=("Courier New", 9))
-        self.log_output.pack(fill='both', expand=True, padx=10, pady=5)
+        # --- Log Output with scrollbar ---
+        log_frame = ttk.Frame(self.root)
+        log_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        log_scrollbar = ttk.Scrollbar(log_frame)
+        log_scrollbar.pack(side='right', fill='y')
+        self.log_output = tk.Text(log_frame, height=4, bg="black", fg="lime green", 
+                                  wrap='word', font=("Courier New", 9), 
+                                  yscrollcommand=log_scrollbar.set)
+        self.log_output.pack(fill='both', expand=True)
+        log_scrollbar.config(command=self.log_output.yview)
 
-    # --- ADDED: Method to update visible columns ---
     def update_visible_columns(self):
         """Updates the treeview to show only the columns selected via checkbox."""
         visible_cols = [h for h, var in self.column_vars.items() if var.get()]
         self.tree["displaycolumns"] = visible_cols
 
-    # --- ADDED: Method for sorting columns ---
     def sort_column(self, col, reverse):
         """Sorts a treeview column when its header is clicked."""
         try:
-            # Extract numerical part for sorting, fall back to string if not possible
             def get_sort_key(value_str):
                 if isinstance(value_str, str):
                     match = re.match(r"(-?\d+\.?\d*)", value_str)
                     if match:
                         return float(match.group(1))
-                return value_str # Fallback for non-numeric strings
-
+                return value_str
             data = [(get_sort_key(self.tree.set(k, col)), k) for k in self.tree.get_children('')]
         except tk.TclError:
             self.log(f"Cannot sort by '{col}' as it is currently hidden.")
-            return # Cannot sort a hidden column
-
+            return
         data.sort(reverse=reverse)
-
         for index, (val, k) in enumerate(data):
             self.tree.move(k, '', index)
-
-        # Toggle sort direction for the next click
         self.tree.heading(col, command=lambda: self.sort_column(col, not reverse))
 
-
     def update_ports_list(self):
-        """Scans for paired Bluetooth COM ports and updates the combobox."""
+        """Scans for ports, formats them with MAC, and updates the combobox."""
         self.log("Scanning for paired Bluetooth devices by MAC address...")
-        ports = list_paired_bluetooth_ports()
-        self.port_combo['values'] = ports
-        if ports:
+        ports_with_mac = list_paired_bluetooth_ports()
+        self.port_map = {f"{port} (MAC: {mac})": port for port, mac in ports_with_mac}
+        display_values = list(self.port_map.keys())
+        self.port_combo['values'] = display_values
+        if display_values:
             self.port_combo.current(0)
-            self.log(f"Found paired ports: {', '.join(ports)}")
+            self.log(f"Found paired ports: {', '.join(display_values)}")
         else:
             self.log("No paired Bluetooth devices with valid MAC addresses found.")
             self.port_combo.set('')
@@ -233,23 +233,23 @@ class OBDLoggerApp:
     
     def connect(self):
         """Starts the connection process using the selected COM port."""
-        port = self.port_combo.get()
-        if not port:
+        display_string = self.port_combo.get()
+        if not display_string:
             self.log("⚠️ Please select a paired port first.")
             return
-
-        # Update the display labels with info from entry boxes
+        port = self.port_map.get(display_string)
+        if not port:
+            self.log(f"Error: Could not find port for '{display_string}'.")
+            return
         self.display_veh_no.set(f"Vehicle No: {self.veh_no.get()}")
         self.display_veh_type.set(f"Vehicle Type: {self.veh_type.get()}")
         self.display_yr_mfr.set(f"Year: {self.yr_mfr.get()}")
-        
         self.log(f"🚀 Starting connection process for {port}...")
         self.connect_btn.config(state='disabled')
         self.monitor_btn.config(state='disabled')
         self.port_combo.config(state='disabled')
         self.refresh_btn.config(state='disabled')
         self.status_label.config(text=f"Status: Connecting to {port}...", foreground="orange")
-        
         threading.Thread(target=self.attempt_connection_on_port, args=(port,), daemon=True).start()
 
     def attempt_connection_on_port(self, port):
@@ -258,9 +258,11 @@ class OBDLoggerApp:
             self.log(f"🧪 Trying connection on {port} (Attempt {attempt}/3)...")
             try:
                 conn = OBD(portstr=port, baudrate=BAUDRATE, fast=False, timeout=5)
-                
                 if conn.is_connected():
                     self.log(f"✅ Connection successful on {port}!")
+                    # ADDED: 5-second stabilization delay
+                    self.log("⏳ Stabilizing connection, please wait 5 seconds...")
+                    time.sleep(5)
                     self.connection = conn
                     self.root.after(0, self.update_ui_on_connect, port)
                     return
@@ -269,9 +271,9 @@ class OBDLoggerApp:
                     conn.close()
             except Exception as e:
                 self.log(f"⛔ Error on {port}: {str(e).strip()}")
-            
+            # ADDED: 2-second delay between attempts
             time.sleep(2)
-
+            
         self.log(f"🚫 All connection attempts failed for {port}.")
         self.root.after(0, self.update_ui_on_fail, "Connection Failed")
 
@@ -294,16 +296,12 @@ class OBDLoggerApp:
         self.log("🔌 Disconnecting...")
         if self.running:
             self.toggle_monitoring()
-        
         if self.connection:
             self.connection.close()
         self.connection = None
-
-        # Reset display labels to their default state
         self.display_veh_no.set("Vehicle No: --")
         self.display_veh_type.set("Vehicle Type: --")
         self.display_yr_mfr.set("Year: --")
-
         self.status_label.config(text="Status: Disconnected", foreground="red")
         self.connect_btn.config(text="Connect", state='normal')
         self.monitor_btn.config(state='disabled')
@@ -327,30 +325,38 @@ class OBDLoggerApp:
     def monitor_data(self):
         """The main data-gathering loop. Runs in a thread."""
         while self.running:
-            if not self.connection or not self.connection.is_connected():
-                self.log("⚠️ Connection lost! Stopping monitoring.")
-                self.root.after(0, self.disconnect)
-                break
+            try:
+                if not self.connection or not self.connection.is_connected():
+                    self.log("⚠️ Connection lost! Stopping monitoring.")
+                    self.root.after(0, self.disconnect)
+                    break
 
-            now = datetime.now(pytz.timezone(TIMEZONE))
-            timestamp = now.isoformat()
+                now = datetime.now(pytz.timezone(TIMEZONE))
+                timestamp = now.isoformat()
+                
+                data_points = {
+                    "Coolant Temp": get_formatted_value(self.connection.query(commands.COOLANT_TEMP)),
+                    "Engine RPM": get_formatted_value(self.connection.query(commands.RPM)),
+                    "Throttle Pos": get_formatted_value(self.connection.query(commands.THROTTLE_POS)),
+                    "Engine Load": get_formatted_value(self.connection.query(commands.ENGINE_LOAD)),
+                    "Speed": get_formatted_value(self.connection.query(commands.SPEED)),
+                    "Fuel Level": get_formatted_value(self.connection.query(commands.FUEL_LEVEL)),
+                    "Intake Temp": get_formatted_value(self.connection.query(commands.INTAKE_TEMP)),
+                    "Ambient Temp": get_formatted_value(self.connection.query(commands.AMBIANT_AIR_TEMP)),
+                }
+                
+                row_data = [data_points.get(h, "N/A") for h in headers[1:]]
+                
+                self.root.after(0, self.update_gui_and_csv, timestamp, row_data)
+                
+                # The refresh rate (delay) is controlled by the REFRESH_RATE global variable
+                time.sleep(REFRESH_RATE)
             
-            data_points = {
-                "Coolant Temp": get_formatted_value(self.connection.query(commands.COOLANT_TEMP)),
-                "Engine RPM": get_formatted_value(self.connection.query(commands.RPM)),
-                "Throttle Pos": get_formatted_value(self.connection.query(commands.THROTTLE_POS)),
-                "Engine Load": get_formatted_value(self.connection.query(commands.ENGINE_LOAD)),
-                "Speed": get_formatted_value(self.connection.query(commands.SPEED)),
-                "Fuel Level": get_formatted_value(self.connection.query(commands.FUEL_LEVEL)),
-                "Intake Temp": get_formatted_value(self.connection.query(commands.INTAKE_TEMP)),
-                "Ambient Temp": get_formatted_value(self.connection.query(commands.AMBIANT_AIR_TEMP)),
-            }
-            
-            row_data = [data_points.get(h, "N/A") for h in headers[1:]]
-            
-            self.root.after(0, self.update_gui_and_csv, timestamp, row_data)
-            
-            time.sleep(REFRESH_RATE)
+            except Exception as e:
+                self.log(f"⛔ ERROR in monitoring loop: {e}")
+                self.log("⏹️ Halting monitoring due to error.")
+                self.root.after(0, self.toggle_monitoring)
+                break
         
         self.root.after(0, lambda: self.monitor_btn.config(text="Start Monitoring"))
         self.running = False
@@ -358,9 +364,9 @@ class OBDLoggerApp:
     def update_gui_and_csv(self, timestamp, row_data):
         """Safely updates the GUI table and writes to the CSV from the main thread."""
         display_ts = timestamp.split('T')[1].split('+')[0].split('.')[0]
-        self.tree.insert('', 'end', values=[display_ts] + row_data)
-        self.tree.yview_moveto(1)
-
+        if self.tree.winfo_exists():
+            self.tree.insert('', 'end', values=[display_ts] + row_data)
+            self.tree.yview_moveto(1)
         full_row = [timestamp, self.veh_no.get(), self.veh_type.get(), self.yr_mfr.get()] + row_data
         append_row_to_csv(CSV_FILENAME, full_row)
 
@@ -373,10 +379,8 @@ class OBDLoggerApp:
             "YR_MFR": self.yr_mfr.get()
         }
         save_config(current_config)
-        
         if self.connection and self.connection.is_connected():
             threading.Thread(target=self.connection.close, daemon=True).start()
-        
         self.root.destroy()
 
 # -------------------- Main Entry Point --------------------
