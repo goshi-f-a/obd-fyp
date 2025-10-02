@@ -29,6 +29,8 @@ def simulate_obd_data():
         time.sleep(REFRESH_RATE)
     print("✅ Simulation complete.")
 
+
+
 if __name__ == "__main__":
     try:
         simulate_obd_data()
